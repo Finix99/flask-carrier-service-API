@@ -35,11 +35,20 @@ else:
         "rate_per_km_nairobi": 90,
         "flat_rate_others": 300
     }
-
 # --- Ensure delivery_history.csv exists ---
 if not os.path.exists(DATA_FILE):
-    pd.DataFrame(columns=["timestamp","latitude","longitude","county",
-                          "distance_km","predicted_price_ksh","predicted_eta_hours"]).to_csv(DATA_FILE, index=False)
+    pd.DataFrame(columns=[
+        "timestamp", "latitude", "longitude", "county",
+        "distance_km", "predicted_price_ksh", "predicted_eta_hours"
+    ]).to_csv(DATA_FILE, index=False)
+
+from flask import Flask, request, jsonify
+import os
+
+app = Flask(__name__)
+
+# 🔒 API Key for authentication (set same key in WooCommerce plugin)
+API_KEY = os.getenv("FLASK_API_KEY", "a94f2f3bd5f14a7f0a41ef73f6827c2e")
 
 @app.route("/")
 def home():
@@ -47,12 +56,19 @@ def home():
 
 @app.route("/predict-rate", methods=["POST"])
 def predict_rate():
+    # --- Authorization check ---
+    client_key = request.headers.get("X-API-Key")
+    if client_key != API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    # --- Parse request ---
     data = request.get_json()
-    try: 
+    try:
         user_lat = float(data["latitude"])
         user_lon = float(data["longitude"])
         county = data.get("county", "Unknown")
-        timestamp = pd.to_datetime(data.get("timestamp", datetime.now().isoformat()))
+        timestamp = data.get("timestamp", datetime.now().isoformat())
+        timestamp = pd.to_datetime(timestamp)
     except Exception as e:
         return jsonify({"error": f"Invalid input: {e}"}), 400
 
@@ -69,7 +85,7 @@ def predict_rate():
         X_pred = pd.DataFrame([[distance_km, county_encoded, hour, dayofweek]],
                               columns=["distance_km", "county_encoded", "hour", "dayofweek"])
         predicted_price = model.predict(X_pred)[0]
-        mode = "AI model"
+        mode = "Nima model"
     else:
         if "nairobi" in county.lower():
             predicted_price = config["rate_per_km_nairobi"] * distance_km
