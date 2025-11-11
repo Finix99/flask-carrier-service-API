@@ -32,8 +32,8 @@ if os.path.exists(CONFIG_FILE):
         config = json.load(f)
 else:
     config = {
-        "rate_per_km_nairobi": 150,
-        "flat_rate_others": 450
+        "rate_per_km_nairobi": 90,
+        "flat_rate_others": 300
     }
 
 # --- Ensure delivery_history.csv exists ---
