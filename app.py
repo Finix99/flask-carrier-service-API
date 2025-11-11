@@ -48,7 +48,7 @@ import os
 app = Flask(__name__)
 
 # 🔒 API Key for authentication (set same key in WooCommerce plugin)
-API_KEY = os.getenv("FLASK_API_KEY", "a94f2f3bd5f14a7f0a41ef73f6827c2e")
+API_KEY = os.getenv("FLASK_API_KEY", "b20f69591f2e4c906777e888437bb690")
 
 @app.route("/")
 def home():
