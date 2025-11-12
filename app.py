@@ -34,10 +34,10 @@ else:
     config = {
         "rate_per_km_nairobi": 28,      # Nairobi per km beyond 1.8 km
         "base_fee_nairobi": 50,         # KSh 50 for short trips
-        "flat_rate_others": 450,        # Out-of-Nairobi flat
+        "flat_rate_others": 300,        # Out-of-Nairobi flat
         "free_shipping_minimum": 3000,
         "min_delivery_order": 500,
-        "zone_surcharge": 200
+        "zone_surcharge": 10
     }
 
 # --- Ensure delivery_history.csv exists ---
