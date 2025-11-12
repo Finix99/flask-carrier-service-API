@@ -1,11 +1,9 @@
 from flask import Flask, request, jsonify
-import joblib, json
-import pandas as pd
+import joblib, json, pandas as pd, os
 from datetime import datetime
 from geopy.distance import geodesic
 from xgboost import XGBRegressor
 from sklearn.preprocessing import LabelEncoder
-import os
 
 app = Flask(__name__)
 
@@ -15,16 +13,18 @@ ENCODER_FILE = "county_encoder.pkl"
 CONFIG_FILE = "config.json"
 DATA_FILE = "delivery_history.csv"
 
-# --- Load trained model & label encoder ---
-model = None
-encoder = None
+# 🔒 API key for security (same must be in WooCommerce plugin)
+API_KEY = os.getenv("FLASK_API_KEY", "b20f69591f2e4c906777e888437bb690")
+
+# --- Load trained model & encoder ---
+model, encoder = None, None
 if os.path.exists(MODEL_FILE) and os.path.exists(ENCODER_FILE):
     model = XGBRegressor()
     model.load_model(MODEL_FILE)
     encoder = joblib.load(ENCODER_FILE)
     print("✅ Loaded trained model and encoder.")
 else:
-    print("⚠️ No model found. Flask will use config-based fallback rates.")
+    print("⚠️ No model found. Using fallback logic...")
 
 # --- Load fallback config ---
 if os.path.exists(CONFIG_FILE):
@@ -32,72 +32,86 @@ if os.path.exists(CONFIG_FILE):
         config = json.load(f)
 else:
     config = {
-        "rate_per_km_nairobi": 90,
-        "flat_rate_others": 300
+        "rate_per_km_nairobi": 28,   # Nairobi: KSh 28 per km (≈1.8 km = 50 KSh)
+        "base_fee_nairobi": 20,      # Dispatch base
+        "flat_rate_others": 450,     # Default for other counties
+        "free_shipping_minimum": 3000,
+        "min_delivery_order": 500,
+        "zone_surcharge": 200
     }
-# --- Ensure delivery_history.csv exists ---
+
+# --- Ensure dataset exists ---
 if not os.path.exists(DATA_FILE):
     pd.DataFrame(columns=[
-        "timestamp", "latitude", "longitude", "county",
-        "distance_km", "predicted_price_ksh", "predicted_eta_hours"
+        "timestamp","latitude","longitude","county",
+        "distance_km","predicted_price_ksh","predicted_eta_hours"
     ]).to_csv(DATA_FILE, index=False)
 
-from flask import Flask, request, jsonify
-import os
-
-app = Flask(__name__)
-
-# 🔒 API Key for authentication (set same key in WooCommerce plugin)
-API_KEY = os.getenv("FLASK_API_KEY", "b20f69591f2e4c906777e888437bb690")
 
 @app.route("/")
 def home():
     return jsonify({"message": "Smart Shipping API active"})
 
+
 @app.route("/predict-rate", methods=["POST"])
 def predict_rate():
-    # --- Authorization check ---
+    # --- 🔒 Authorization ---
     client_key = request.headers.get("X-API-Key")
     if client_key != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
 
-    # --- Parse request ---
     data = request.get_json()
     try:
         user_lat = float(data["latitude"])
         user_lon = float(data["longitude"])
         county = data.get("county", "Unknown")
-        timestamp = data.get("timestamp", datetime.now().isoformat())
-        timestamp = pd.to_datetime(timestamp)
+        timestamp = pd.to_datetime(data.get("timestamp", datetime.now().isoformat()))
+        order_total = float(data.get("order_total", 0))
     except Exception as e:
         return jsonify({"error": f"Invalid input: {e}"}), 400
 
+    # --- Compute distance ---
     distance_km = geodesic(BASE_LOCATION, (user_lat, user_lon)).km
 
-    # --- AI prediction ---
+    # --- Check minimum order ---
+    if order_total < config["min_delivery_order"]:
+        return jsonify({
+            "error": f"Minimum order for delivery is KSh {config['min_delivery_order']}",
+            "eligible": False
+        }), 400
+
+    # --- AI or fallback ---
     if model and encoder:
         hour = timestamp.hour
         dayofweek = timestamp.dayofweek
-        if county not in encoder.classes_:
-            county_encoded = 0
-        else:
-            county_encoded = encoder.transform([county])[0]
+        county_encoded = encoder.transform([county])[0] if county in encoder.classes_ else 0
         X_pred = pd.DataFrame([[distance_km, county_encoded, hour, dayofweek]],
                               columns=["distance_km", "county_encoded", "hour", "dayofweek"])
         predicted_price = model.predict(X_pred)[0]
-        mode = "Nima model"
+        mode = "AI model"
     else:
+        # --- Smart fallback pricing ---
         if "nairobi" in county.lower():
-            predicted_price = config["rate_per_km_nairobi"] * distance_km
+            # Free delivery threshold
+            if order_total >= config["free_shipping_minimum"]:
+                predicted_price = 0
+            else:
+                rate = config["rate_per_km_nairobi"]
+                base_fee = config["base_fee_nairobi"]
+                predicted_price = base_fee + (rate * distance_km)
         else:
-            predicted_price = config["flat_rate_others"]
-        mode = "fallback"
+            # Out of Nairobi: apply flat + optional surcharge
+            predicted_price = config["flat_rate_others"] + config["zone_surcharge"]
 
+        mode = "rule-based"
+
+    # --- Return final price ---
     return jsonify({
         "distance_km": round(distance_km, 2),
         "predicted_price_ksh": round(float(predicted_price), 2),
         "mode": mode
     })
+
 
 @app.route("/predict-eta", methods=["POST"])
 def predict_eta():
@@ -111,10 +125,11 @@ def predict_eta():
         return jsonify({"error": f"Invalid input: {e}"}), 400
 
     distance_km = geodesic(BASE_LOCATION, (user_lat, user_lon)).km
-    eta_hours = 2.0 if "nairobi" in county.lower() else 6.0
+    eta_hours = 1.5 if "nairobi" in county.lower() else 6.0
 
-    # Log prediction for future training
-    entry = {
+    # Log sample
+    df = pd.read_csv(DATA_FILE)
+    df = pd.concat([df, pd.DataFrame([{
         "timestamp": timestamp.isoformat(),
         "latitude": user_lat,
         "longitude": user_lon,
@@ -122,14 +137,15 @@ def predict_eta():
         "distance_km": round(distance_km,2),
         "predicted_price_ksh": None,
         "predicted_eta_hours": eta_hours
-    }
-    df = pd.read_csv(DATA_FILE)
-    df = pd.concat([df, pd.DataFrame([entry])], ignore_index=True)
+    }])], ignore_index=True)
     df.to_csv(DATA_FILE, index=False)
 
-    return jsonify({"predicted_eta_hours": round(eta_hours,2),
-                    "eta_label": f"≈{int(eta_hours)}h",
-                    "mode":"fallback"})
+    return jsonify({
+        "predicted_eta_hours": round(eta_hours,2),
+        "eta_label": f"≈{int(eta_hours)}h",
+        "mode": "rule-based"
+    })
+
 
 @app.route("/log-delivery", methods=["POST"])
 def log_delivery():
@@ -148,7 +164,7 @@ def log_delivery():
     eta_hours = (delivered_ts - order_ts).total_seconds() / 3600.0
 
     df = pd.read_csv(DATA_FILE)
-    entry = {
+    df = pd.concat([df, pd.DataFrame([{
         "timestamp": order_ts.isoformat(),
         "latitude": lat,
         "longitude": lon,
@@ -156,10 +172,11 @@ def log_delivery():
         "distance_km": round(distance_km,2),
         "predicted_price_ksh": price,
         "predicted_eta_hours": round(eta_hours,2)
-    }
-    df = pd.concat([df, pd.DataFrame([entry])], ignore_index=True)
+    }])], ignore_index=True)
     df.to_csv(DATA_FILE, index=False)
+
     return jsonify({"status":"ok"}), 201
+
 
 if __name__ == "__main__":
     app.run(debug=False)
