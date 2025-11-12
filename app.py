@@ -37,7 +37,7 @@ else:
         "flat_rate_others": 450,     # Default for other counties
         "free_shipping_minimum": 3000,
         "min_delivery_order": 500,
-        "zone_surcharge": 40
+        "zone_surcharge": 10
     }
 
 # --- Ensure dataset exists ---
