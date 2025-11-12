@@ -13,10 +13,10 @@ ENCODER_FILE = "county_encoder.pkl"
 CONFIG_FILE = "config.json"
 DATA_FILE = "delivery_history.csv"
 
-# 🔒 API key for security (same must be in WooCommerce plugin)
+# 🔒 API key (same must be in WooCommerce plugin)
 API_KEY = os.getenv("FLASK_API_KEY", "b20f69591f2e4c906777e888437bb690")
 
-# --- Load trained model & encoder ---
+# --- Load model & encoder if exists ---
 model, encoder = None, None
 if os.path.exists(MODEL_FILE) and os.path.exists(ENCODER_FILE):
     model = XGBRegressor()
@@ -24,7 +24,7 @@ if os.path.exists(MODEL_FILE) and os.path.exists(ENCODER_FILE):
     encoder = joblib.load(ENCODER_FILE)
     print("✅ Loaded trained model and encoder.")
 else:
-    print("⚠️ No model found. Using fallback logic...")
+    print("⚠️ No model found. Using fallback rules...")
 
 # --- Load fallback config ---
 if os.path.exists(CONFIG_FILE):
@@ -32,15 +32,15 @@ if os.path.exists(CONFIG_FILE):
         config = json.load(f)
 else:
     config = {
-        "rate_per_km_nairobi": 28,   # Nairobi: KSh 28 per km (≈1.8 km = 50 KSh)
-        "base_fee_nairobi": 20,      # Dispatch base
-        "flat_rate_others": 450,     # Default for other counties
+        "rate_per_km_nairobi": 28,      # Nairobi per km beyond 1.8 km
+        "base_fee_nairobi": 50,         # KSh 50 for short trips
+        "flat_rate_others": 450,        # Out-of-Nairobi flat
         "free_shipping_minimum": 3000,
         "min_delivery_order": 500,
-        "zone_surcharge": 10
+        "zone_surcharge": 200
     }
 
-# --- Ensure dataset exists ---
+# --- Ensure delivery_history.csv exists ---
 if not os.path.exists(DATA_FILE):
     pd.DataFrame(columns=[
         "timestamp","latitude","longitude","county",
@@ -55,7 +55,7 @@ def home():
 
 @app.route("/predict-rate", methods=["POST"])
 def predict_rate():
-    # --- 🔒 Authorization ---
+    # 🔒 Authorization
     client_key = request.headers.get("X-API-Key")
     if client_key != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
@@ -64,23 +64,22 @@ def predict_rate():
     try:
         user_lat = float(data["latitude"])
         user_lon = float(data["longitude"])
-        county = data.get("county", "Unknown")
+        county = data.get("county", "Unknown").strip()
         timestamp = pd.to_datetime(data.get("timestamp", datetime.now().isoformat()))
         order_total = float(data.get("order_total", 0))
     except Exception as e:
         return jsonify({"error": f"Invalid input: {e}"}), 400
 
-    # --- Compute distance ---
     distance_km = geodesic(BASE_LOCATION, (user_lat, user_lon)).km
 
-    # --- Check minimum order ---
+    # Minimum order check
     if order_total < config["min_delivery_order"]:
         return jsonify({
             "error": f"Minimum order for delivery is KSh {config['min_delivery_order']}",
             "eligible": False
         }), 400
 
-    # --- AI or fallback ---
+    # AI prediction if exists
     if model and encoder:
         hour = timestamp.hour
         dayofweek = timestamp.dayofweek
@@ -90,22 +89,25 @@ def predict_rate():
         predicted_price = model.predict(X_pred)[0]
         mode = "AI model"
     else:
-        # --- Smart fallback pricing ---
-        if "nairobi" in county.lower():
-            # Free delivery threshold
+        # Rule-based fallback
+        if county.lower() == "nairobi county":
             if order_total >= config["free_shipping_minimum"]:
                 predicted_price = 0
             else:
-                rate = config["rate_per_km_nairobi"]
-                base_fee = config["base_fee_nairobi"]
-                predicted_price = base_fee + (rate * distance_km)
+                # Smooth Nairobi pricing
+                if distance_km <= 1.8:
+                    predicted_price = config["base_fee_nairobi"]
+                else:
+                    extra_distance = distance_km - 1.8
+                    predicted_price = config["base_fee_nairobi"] + (config["rate_per_km_nairobi"] * extra_distance)
         else:
-            # Out of Nairobi: apply flat + optional surcharge
-            predicted_price = config["flat_rate_others"] + config["zone_surcharge"]
+            if order_total >= config["free_shipping_minimum"]:
+                predicted_price = 0
+            else:
+                predicted_price = config["flat_rate_others"] + config["zone_surcharge"]
 
         mode = "rule-based"
 
-    # --- Return final price ---
     return jsonify({
         "distance_km": round(distance_km, 2),
         "predicted_price_ksh": round(float(predicted_price), 2),
@@ -119,29 +121,40 @@ def predict_eta():
     try:
         user_lat = float(data["latitude"])
         user_lon = float(data["longitude"])
-        county = data.get("county", "Unknown")
+        county = data.get("county", "Unknown").strip()
         timestamp = pd.to_datetime(data.get("timestamp", datetime.now().isoformat()))
     except Exception as e:
         return jsonify({"error": f"Invalid input: {e}"}), 400
 
     distance_km = geodesic(BASE_LOCATION, (user_lat, user_lon)).km
-    eta_hours = 1.5 if "nairobi" in county.lower() else 6.0
 
-    # Log sample
-    df = pd.read_csv(DATA_FILE)
-    df = pd.concat([df, pd.DataFrame([{
+    # ETA logic
+    if county.lower() == "nairobi county":
+        if distance_km <= 1.8:
+            eta_hours = 0.5
+        elif distance_km <= 5:
+            eta_hours = 1.0
+        else:
+            eta_hours = 1.5
+    else:
+        eta_hours = 6.0
+
+    # Log prediction for future AI fine-tuning
+    entry = {
         "timestamp": timestamp.isoformat(),
         "latitude": user_lat,
         "longitude": user_lon,
         "county": county,
-        "distance_km": round(distance_km,2),
+        "distance_km": round(distance_km, 2),
         "predicted_price_ksh": None,
         "predicted_eta_hours": eta_hours
-    }])], ignore_index=True)
+    }
+    df = pd.read_csv(DATA_FILE)
+    df = pd.concat([df, pd.DataFrame([entry])], ignore_index=True)
     df.to_csv(DATA_FILE, index=False)
 
     return jsonify({
-        "predicted_eta_hours": round(eta_hours,2),
+        "predicted_eta_hours": round(eta_hours, 2),
         "eta_label": f"≈{int(eta_hours)}h",
         "mode": "rule-based"
     })
